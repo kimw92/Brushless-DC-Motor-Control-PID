@@ -1,0 +1,361 @@
+/***************************************************************
+
+Filename: PROPORTIONAL_INTEGREAL_DERIVATIVE_CONTROL_MOTOR_TEST.C
+Written by:  William Kim
+Date: June 14, 2008
+Purpose:  To understand and implement a PID controller
+using a PIC Microcontroller based motor control development board 
+and a BLDC motor. 
+
+The goals of the project are to:
+
+1. Measure and calculate RPM based on Hall effect sensor feedback
+2. Generate PWM signals for the motor drive transistors
+3. Develop a PID algorithm for closed loop BLDC velocity control
+4. Display the RPM data via RS-232 to the computer HyperTerminal
+for recording.
+
+****************************************************************/
+
+#include <p18f2431.h>
+#include <pconfig.h>  
+#include <adc.h>
+#include <stdlib.h>
+#include <delays.h>
+#include <stdio.h>
+#include <usart.h>
+#include <string.h>
+
+#define PIN_C5     PORTCbits.RC5  // Constant definition for PIN C5.
+#define PIN_C4     PORTCbits.RC4  // Constant definition for PIN C4.
+#define PIN_C3     PORTCbits.RC3  // Constant definition for PIN C3. 
+
+#define SWTXD PORTC  
+#define SWTXDpin 6
+#define TRIS_SWTXD TRISC
+#define SWRXD PORTC
+#define SWRXDpin 7
+#define TRIS_SWRXD TRISC
+
+#define BAUD 115200 	// Setup UART BAUD rate to 115,200bps
+#define CLK 20000000 	// Uses 20Mhz Resonator
+
+// Variable Declarations
+volatile unsigned int rpm=0, flag=0;
+volatile float rev=0;
+int setpoint_num=0, duty=0, error=0, integral_sum=0, error_diff=0, error_previous=0;   
+char setpoint[3];
+unsigned int storePDCH, storePDCL, p, HallValue, 
+		Hall_Lookup_Table[] = { 0X00, 
+					0X12, 0X24, 0X06,
+					0X09, 0X18, 0X21, 
+					0X00 };// STEP 0,1,2,3,4,5,6,0.
+					       // These steps will tell which PWM channels,
+					       // and therefore, phases, to activate based
+					       // based on Hall sensor inputs.
+
+void Check_Hall_Sensors(void); 
+#pragma interrupt Check_Hall_Sensors // Tell compiler that "Check_Hall_Sensors" is interrupt.
+void Check_Hall_Sensors (void)	     // Interrupt Service Routine Code.
+{
+	//*************************************************************
+	//*************************************************************
+	//TIMER0. This timer keeps track of seconds.  It interrupts
+	//the program every second.  A multiplier is used to find RPM. 
+	if (INTCONbits.TMR0IF == 1) // TIMER 0 Interrupt FLAG. "1" indicates if event is true.
+	{
+		PIN_C4 = ~PIN_C4;
+		INTCONbits.TMR0IF = 0;	// Reset 0 Flag.
+		TMR0H=0x68;		// Sample at ~1.006Hz.
+		TMR0L=0x00;       	// OSCILLOSCOPE ~ 503 mHZ.
+		rpm = (int)rev*0.74074; // (60sec./81pulses = 0.74074)float value  
+		flag=1;		
+		rev=0;
+	}
+	//*************************************************************
+	//*************************************************************
+	//** INPUT CAPTURE 1,2,&3 FLAGS. These flags set when there is
+	//** ANY change in any hall sensor state.  This enables us to keep track
+	//** of how many revolutions of the shaft. This is needed to 
+	//** calculate RPM.
+	//** 12 hall state changes * 6.75:1 (gear ratio) = 81 hall state 
+	//** changes per mechanical revolution. 
+	//*************************************************************
+    	if ( (PIR3bits.IC1IF == 1) ||(PIR3bits.IC2QEIF == 1) ||  (PIR3bits.IC3DRIF == 1) )
+	{	rev=rev+1;			// increment rev for every hall state change
+		PIR3bits.IC1IF = 0;		// Reset Flag.
+		PIR3bits.IC2QEIF = 0;
+		PIR3bits.IC3DRIF = 0;
+		HallValue = PORTA & 0x1C;	// mask RB2,3 & 4	0001 1100 0x1C
+		HallValue = HallValue >> 2;	// shift right 2 times
+        	OVDCOND = Hall_Lookup_Table[HallValue];//CAP3=S1, CAP2=S2, CAP1=S3. 
+						      //Storing in "OVDCOND" reg will define
+						      //which PWM channels to activate.  
+	}						
+	//*************************************************************
+}
+
+// High priority interrupt vector
+// Tell compiler this is code section for Interrupt Vector using #pragma
+// in specific starting address in memory section.
+// This locates the code section, "InterruptVectorHigh" at program memory address 0x000008.
+#pragma code InterruptVectorHigh = 0x000008  
+void					     
+InterruptVectorHigh (void)		    
+{
+  _asm
+    goto Check_Hall_Sensors  //jump to interrupt routine
+  _endasm
+}
+#pragma code
+
+void setup_PWM(void);    // SETUP PWM REGISTERS.
+void setup_input_capture(void);  //SETUP INPUT CAPTURE REGISTERS CAP1CON.
+void setup_UART(void);   // SETUP UART REGISTERS.
+void setup_IO(void);     // SETUP I/O. 
+void setup_Input_Capture_Interrupt(void);//SETUP & Enable Input_Capture_Interrupt & Timer0 Interrupt.
+void Read_First_Hall_Position(void);  // Read first hall position upon start-up because ISR won't 
+				      // recognize it because no IC interrupt flag 
+				      // b/c the motor did not move.
+
+void main (void)
+{ 
+  setup_PWM();          		// SETUP PWM REGISTERS.
+  setup_input_capture();		//SETUP INPUT CAPTURE REGISTERS CAP1CON.
+  setup_UART();    			// SETUP UART REGISTERS.
+  setup_IO();     			// SETUP I/O.
+  setup_Input_Capture_Interrupt();  	// SETUP Timer0 and Input Capture interrupts. 
+  Read_First_Hall_Position();  		// Read first hall position upon start-up
+  OpenUSART( USART_TX_INT_OFF & 
+ 	     USART_RX_INT_OFF &  
+	     USART_ASYNCH_MODE &
+	     USART_EIGHT_BIT &
+	     USART_SYNC_SLAVE & 
+	     USART_CONT_RX & 
+	     USART_BRGH_HIGH, 10 );
+
+  printf ("\f\r\n PIC18F2431 TIMER8 TEST\n");  // Display on HyperTerminal
+  printf("\n\rTYPE IN SETPOINT 3 Characters:");
+		
+   getsUSART(setpoint, 3);
+   for (p=0; p<3; p++)
+   { 
+	while ( BusyUSART() );  // make sure the serial port isn't busy.
+     	{
+		WriteUSART( setpoint[p] );  // Display setpoint 
+	}
+   } // end for
+
+  setpoint_num = atoi(setpoint);  // ASCII TO INTEGER.
+
+  printf("\n\rATOI: %s %d ", setpoint, setpoint_num );	//Display setpoint in both string & int.
+  printf("\n\rMotor Running...");
+
+  while (1)
+    { start:
+	if (flag == 1)
+	{
+		flag = 0;
+		printf("\n\r%u", rpm);
+
+		//if setpoint_num is within +/- 3 RPM, go to start.
+		if ( (rpm < setpoint_num+3) && (rpm > setpoint_num-3) )  
+		{ goto start; }
+			
+		if (rpm < setpoint_num)
+		{   
+			error = setpoint_num - rpm;
+
+			if(error > error_previous)
+			{
+				error_diff = error - error_previous;
+			}
+			else if(error < error_previous)
+			{
+				error_diff = error_previous - error;
+			}
+			integral_sum = integral_sum + error;
+
+			if(integral_sum >= 30000)
+			{ integral_sum = 30000; }
+
+			duty = (int)duty + ((int)error/40) + ((int)integral_sum/2000) + ((int)error_diff/25); // PID
+			    
+			error_previous = error;
+				
+			storePDCH = (int)duty & 0b11000000;  // Mask first 2 bits (MSB) and store. duty cycle
+			PDC0H = storePDCH >> 6;  	     // Move 6 places to the right to set PWM-Duty-Cycle0 High reg.
+			PDC1H = PDC0H;			     // PWM-Duty-Cycle1 High reg.
+			PDC2H = PDC0H;			     // PWM-Duty-Cycle2 High reg.
+			storePDCL = (int)duty & 0b00111111;  // Mask last 6 bits and store.
+			PDC0L = storePDCL << 2;  	     // Move 2 places to the LEFT to set PWM-Duty-Cycle0 Low reg.
+			PDC1L = PDC0L;			     // PWM-Duty-Cycle1 High reg.
+			PDC2L = PDC0L;			     // PWM-Duty-Cycle2 High reg.
+		}
+		else if (rpm > setpoint_num)
+		{   
+			error = rpm - setpoint_num;                  // CALCULATE ERROR. PROPORTIONAL
+			if(error > error_previous)
+			{
+				error_diff = error - error_previous;
+			}
+			else if(error < error_previous)
+			{
+				error_diff = error_previous - error;
+			}
+	
+			integral_sum = integral_sum + error;        // ACCUMULATE ERROR FOR INTEGRAL TERM
+				
+			if(integral_sum < 0)
+			{ integral_sum = 0;}
+			
+			duty = (int)duty - ((int)error/40) - ((int)integral_sum/2000) - ((int)error_diff/25); // PID
+				
+			error_previous = error;
+
+			storePDCH = (int)duty & 0b11000000;  // Mask first 2 bits (MSB) and store. duty cycle
+			PDC0H = storePDCH >> 6;  	     // Move 6 places to the right to load PD0H registers.
+			PDC1H = PDC0H;
+			PDC2H = PDC0H;
+			storePDCL = (int)duty & 0b00111111;  // Mask last 6 bits and store.
+			PDC0L = storePDCL << 2;  	     // Move 2 places to the LEFT to load PD0Low registers.
+			PDC1L = PDC0L;
+			PDC2L = PDC0L;	
+			
+		}// end if
+
+	} // end if
+
+		
+    } //END WHILE (1)
+
+} //END MAIN
+
+
+//*************************************************************
+//*************************************************************
+//*************** FUNCTIONS Below *****************************
+//*************************************************************
+
+void setup_PWM(void) // SETUP PWM REGISTERS.
+{
+  PTCON0 = 0b00000000;  //Free-running mode (edge aligned). Pg 186
+  PTCON1 = 0b10000000;  //PWM Time Base timer Enable bit ON. pg 186
+  PWMCON0 = 0b01001111; //PWM0 to PWM5 ENABLED for output. Independent Mode.
+  PWMCON1 = 0b00000000; //Special Event Trigger. Duty Cycle update enable.
+  PTPERH = 0b00000000;  // PWM PERIOD HIGH  PWMfrequency = 22kHz. make sure to change duty cycle as well.
+  PTPERL = 0b11100010;  // PWM PERIOD LOW.  Set to 0000 1110 0010 Decimal 226.
+
+  PDC0H = 0b00000001;	// DUTY CYCLE FOR PWM0 AND PWM1 
+  PDC0L = 0b00000000;   // DUTY CYCLE FOR PWM0 AND PWM1  // 16% of 312 = 110010=DEC.50
+  PDC1H = 0b00000001;	// DUTY CYCLE FOR PWM2 AND PWM3  // 50% of 312 (pwm period) = 1001 1100 = 156 Dec.
+  PDC1L = 0b00000000;   // DUTY CYCLE FOR PWM2 AND PWM3  // 22khz: 50% of 226 (pwm period) = 0111 0001 = 113 Dec.
+  PDC2H = 0b00000001;	// DUTY CYCLE FOR PWM4 AND PWM5  // 30khz: 50% of 166 (pwm period) = 0101 0011 = 83 Dec.	
+  PDC2L = 0b00000000;   // DUTY CYCLE FOR PWM4 AND PWM5
+  
+  OVDCONS = 0b00000000;
+  OVDCOND = 0b00000000;
+}
+
+void setup_input_capture() // Setup Input Capture Registers
+{
+  CAP1CON = 0B00001000; // interrupt on every hall state change
+  CAP2CON = 0B00001000;	// interrupt on every hall state change
+  CAP3CON = 0B00001000;	// interrupt on every hall state change
+}
+
+void setup_UART(void)  // SETUP UART REGISTERS.
+{
+  SPBRG = 10;		// 115,200 baud @ 20MHz
+  TXSTA = 0x24;		// setup USART transmit, High speed mode (BRGH bit set)
+  RCSTA = 0x90;		// setup USART receive	
+}
+
+void setup_IO(void)    // SETUP I/O Type.
+{
+  TRISC = 0b00000000;  // 0=output and 1=input.
+  PIN_C3 = 0;
+  PIN_C4 = 0;
+  PIN_C5 = 0;
+}
+
+void setup_Input_Capture_Interrupt(void) // SETUP Timer1 and interrupts. 
+{
+  RCONbits.IPEN = 1; 	// Enable Priority Levels on interrupts.
+  INTCONbits.GIEL = 0; 	// When IPEN = 1, then Disable low priority interrupts
+  INTCONbits.GIEH = 1; 	// Enables all high priority interrupt
+	
+  T0CON = 0B10000110;     // Enable Timer0, 16bit timer, CLKO, low-to-high,assigned, 1:128 prescale.
+  INTCON2bits.TMR0IP = 1; // Make timer0 interrupt high priority
+  INTCONbits.TMR0IE = 1;  // Enables the TMR0 overflow interrupt.
+  INTCONbits.TMR0IF = 0;	// Clear T1 flag
+
+  TMR0H=0x00;		// Sample at 13 Hz
+  TMR0L=0x00;
+  
+  IPR3bits.IC1IP = 1; 	// Make INPUT CAPTURE interrupt high priority
+  PIE3bits.IC1IE = 1;     // Enables the TMR1 overflow interrupt.
+  PIR3bits.IC1IF = 0;	// Clear T1 flag
+	
+  IPR3bits.IC2QEIP = 1; 	// Make INPUT CAPTURE interrupt high priority
+  PIE3bits.IC2QEIE = 1;   // Enables the TMR1 overflow interrupt.
+  PIR3bits.IC2QEIF = 0;	// Clear T1 flag
+
+  IPR3bits.IC3DRIP = 1; 	// Make INPUT CAPTURE interrupt high priority
+  PIE3bits.IC3DRIE = 1;   // Enables the TMR1 overflow interrupt.
+  PIR3bits.IC3DRIF = 0;	// Clear T1 flag	
+}
+
+void Read_First_Hall_Position(void)  // Read first hall position upon start-up
+{
+  HallValue = PORTA & 0x1C;	// mask RB2,3 & 4  0001 1100 0x1C
+  HallValue = HallValue >> 2;	// shift right 2 times
+  OVDCOND = Hall_Lookup_Table[HallValue];//CAP3=S1, CAP2=S2, CAP1=S3.
+}
+
+
+/*  // Below code is not used, but kept in to help understand the hall 
+    // sensor inputs and the corresponding PWM phase outputs
+    // along with LED indicator outputs on C3, C4, C5 to show 
+    // Hall state changes.
+switch (HallValue)
+{	
+  case 0x04: OVDCOND = 0b00001001;  //STEP 1. 0x09
+	PIN_C5 = 1;
+	PIN_C4 = 0;
+	PIN_C3 = 0;
+	break;
+case 0x06: OVDCOND = 0b00100001; //STEP 2. 0x21
+	PIN_C5 = 1;
+	PIN_C4 = 1;
+	PIN_C3 = 0;
+	break;
+case 0x02: OVDCOND = 0b00100100; //STEP 3 0x24
+	PIN_C5 = 0;
+	PIN_C4 = 1;
+	PIN_C3 = 0;
+	break;
+case 0x03: OVDCOND = 0b00000110; //STEP 4 0x06
+	PIN_C5 = 0;
+	PIN_C4 = 1;
+	PIN_C3 = 1;
+	break;
+case 0x01: OVDCOND = 0b00010010; //STEP 5 0x12
+	PIN_C5 = 0;
+	PIN_C4 = 0;
+	PIN_C3 = 1;
+	break;
+case 0x05: OVDCOND = 0b00011000; //STEP 6 0x18
+	PIN_C5 = 1;
+	PIN_C4 = 0;
+	PIN_C3 = 1;
+	break;
+default: OVDCOND = 0b00000000; 
+	PIN_C5 = 0;
+	PIN_C4 = 0;
+	PIN_C3 = 0;
+	break;
+}// end switch
+
+*/
+
